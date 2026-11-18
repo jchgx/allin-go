@@ -310,11 +310,8 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 		}
 	}
 	if needBridge {
-		if head.Stream {
-			s.fail(w, http.StatusBadRequest,
-				"当前版本还不支持跨协议的流式转换（客户端是 "+string(proto)+"，上游是 "+string(upstreamProto)+"），请把 stream 设为 false")
-			return
-		}
+		// 跨协议的流式现在做真正的逐帧转换（见 bridge/stream.go），
+		// 不再要求客户端关掉 stream —— Claude 客户端默认就是流式，没法关。
 		if proto == protocolAnthropic && upstreamProto == protocolOpenAI {
 			upstreamBody, err = bridge.AnthropicToOpenAI(body, realModel)
 		} else if proto == protocolOpenAI && upstreamProto == protocolAnthropic {
@@ -520,7 +517,10 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 				s.fail(w, http.StatusInternalServerError, "构造上游请求失败: "+err.Error())
 				return
 			}
-			if (head.Stream || kind == provider.KindWorkBuddy || kind == provider.KindTrae || kind == provider.KindOpenAI) && !needBridge {
+			// 客户端要流式就告诉上游要 SSE。跨协议时也一样：请求体已经被转成
+			// 上游协议的 stream:true，这里再因为 needBridge 去掉 Accept 头，
+			// 有些上游会按非流式回 JSON，转换器就一口也读不到。
+			if head.Stream || kind == provider.KindWorkBuddy || kind == provider.KindTrae || kind == provider.KindOpenAI {
 				upreq.Header.Set("Accept", "text/event-stream")
 			}
 			upreq = upreq.WithContext(r.Context())
@@ -753,6 +753,39 @@ func (s *Server) relay(w http.ResponseWriter, resp *http.Response, stream, needB
 		return
 	}
 
+	// 流式且需要转换：逐帧转换后写给客户端，不缓存整条响应
+	if stream && needBridge {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(resp.StatusCode)
+		flusher, canFlush := w.(http.Flusher)
+		flush := func() {
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		var inTok, outTok int
+		var cerr error
+		if clientProto == protocolAnthropic {
+			// 客户端 Anthropic ← 上游 OpenAI
+			inTok, outTok, cerr = bridge.StreamOpenAIToAnthropic(resp.Body, w, model, flush)
+		} else {
+			// 客户端 OpenAI ← 上游 Anthropic
+			inTok, outTok, cerr = bridge.StreamAnthropicToOpenAI(resp.Body, w, model)
+			flush()
+		}
+		if cerr != nil {
+			// 已经写过帧，状态码改不了了：记日志 + 记账，别假装成功
+			log.Printf("流式协议转换中断（%s ← %s）: %v", clientProto, model, cerr)
+			uc.record(providerID, model, false, usageTokens{In: inTok, Out: outTok, Total: inTok + outTok})
+			return
+		}
+		uc.record(providerID, model, true, usageTokens{In: inTok, Out: outTok, Total: inTok + outTok})
+		return
+	}
+
 	// 非流式：完整读取后按需转换
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
@@ -760,12 +793,31 @@ func (s *Server) relay(w http.ResponseWriter, resp *http.Response, stream, needB
 		s.fail(w, http.StatusBadGateway, "读取上游响应失败: "+err.Error())
 		return
 	}
-	u := usageFromJSON(raw)
 	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	// 客户端要非流式，但上游只肯流式（WorkBuddy / Trae 会被强制 stream:true）：
+	// 先把事件流聚合成整包，再走下面的转换/回写。不做这一步的话，
+	// 下一步会拿 SSE 字节当 JSON 解析，报「invalid character ':'」这种看不懂的错。
+	if ok && bridge.LooksLikeSSE(raw) {
+		var aggErr error
+		if needBridge && clientProto != protocolAnthropic {
+			// 客户端 OpenAI、上游 Anthropic
+			raw, aggErr = bridge.AggregateAnthropicSSE(bytes.NewReader(raw))
+		} else {
+			raw, aggErr = bridge.AggregateOpenAISSE(bytes.NewReader(raw))
+		}
+		if aggErr != nil {
+			uc.record(providerID, model, false, usageTokens{})
+			s.fail(w, http.StatusBadGateway, "上游返回事件流但聚合失败: "+aggErr.Error())
+			return
+		}
+	}
+
+	u := usageFromJSON(raw)
 	if !needBridge {
 		uc.record(providerID, model, ok, u)
 		ct := resp.Header.Get("Content-Type")
-		if ct == "" {
+		if ct == "" || bridge.LooksLikeSSE(raw) {
 			ct = "application/json"
 		}
 		w.Header().Set("Content-Type", ct)

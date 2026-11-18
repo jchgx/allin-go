@@ -33,17 +33,16 @@ import (
 
 // forwardWebChat 处理三家网页版协议的聊天请求。
 func (s *Server) forwardWebChat(w http.ResponseWriter, r *http.Request, p *config.Provider, kind, realModel string, body []byte, stream bool, proto protocol, uc *usageCtx) {
-	// 客户端说 Anthropic 形态时先转成 OpenAI 请求内部使用。跨协议的流式仍然不支持，
-	// 口径跟 forward 里其它供应商保持一致，别让客户端以为能用。
+	// 客户端说 Anthropic 形态时先转成 OpenAI 请求内部使用。
+	//
+	// 这三家（妙手 / 文心 / Antigravity）的上游只能整包给结果，没有可逐帧转换的
+	// OpenAI chunk 流，所以流式请求这里改成「内部非流式 + 把整包重放成事件流」：
+	// 客户端拿到的是合规的 Anthropic SSE，只是不增量。比直接报 400 让用户去关
+	// stream 要好 —— Claude 客户端默认就是流式，那个开关它根本不给你。
 	needBridge := proto == protocolAnthropic
+	clientStream := stream
 	upstreamBody := body
 	if needBridge {
-		if stream {
-			uc.fail(p.ID, realModel)
-			s.fail(w, http.StatusBadRequest,
-				"当前版本还不支持跨协议的流式转换（客户端是 anthropic，上游是 openai），请把 stream 设为 false")
-			return
-		}
 		converted, err := bridge.AnthropicToOpenAI(body, realModel)
 		if err != nil {
 			uc.fail(p.ID, realModel)
@@ -51,6 +50,8 @@ func (s *Server) forwardWebChat(w http.ResponseWriter, r *http.Request, p *confi
 			return
 		}
 		upstreamBody = converted
+		// 内部一律走非流式：上游聚合完再整包重放
+		stream = false
 	}
 
 	tried := map[string]bool{}
@@ -123,6 +124,27 @@ func (s *Server) forwardWebChat(w http.ResponseWriter, r *http.Request, p *confi
 					return
 				}
 				out = converted
+				if clientStream {
+					// 客户端要的是流：把整包重放成合规的 Anthropic 事件流
+					w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+					w.Header().Set("Cache-Control", "no-cache")
+					w.Header().Set("Connection", "keep-alive")
+					w.Header().Set("X-Accel-Buffering", "no")
+					w.WriteHeader(http.StatusOK)
+					flusher, canFlush := w.(http.Flusher)
+					flush := func() {
+						if canFlush {
+							flusher.Flush()
+						}
+					}
+					if _, _, serr := bridge.WriteAnthropicSSEFromMessage(out, w, realModel, flush); serr != nil {
+						log.Printf("%s/%s 流式重放失败: %v", p.ID, acct.ID, serr)
+						uc.record(p.ID, realModel, false, u)
+						return
+					}
+					uc.record(p.ID, realModel, true, u)
+					return
+				}
 			}
 			uc.record(p.ID, realModel, true, u)
 			w.Header().Set("Content-Type", "application/json")
