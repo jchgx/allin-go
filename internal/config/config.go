@@ -215,6 +215,62 @@ type ReasoningConfig struct {
 	Effort string `json:"effort,omitempty"`
 }
 
+// SanitizeConfig 是「身份词屏蔽」配置。
+//
+// 为什么需要：WorkBuddy 的网关会扫请求里的文本，认出第三方 Agent 的
+// 自我描述（比如「You are an AI agent powered by DeepSeek Harness」）后
+// 用 400 / code 11-128 拒掉整条请求。把这类身份词换成中性说法，
+// 就能在不改提示词含义的前提下降低被识别出来的概率。
+//
+// 默认开启、默认词表只含实测过的词 —— 不猜着扩表，避免把本来能过的
+// 请求也改掉。改完即时生效，不需要重启。
+type SanitizeConfig struct {
+	// Enabled 为 nil 视为开启（新装即有保护）。
+	Enabled *bool `json:"enabled,omitempty"`
+	// Terms 是要屏蔽的身份词；为空时用 DefaultSanitizeTerms。
+	Terms []string `json:"terms,omitempty"`
+	// Replacement 是替换成什么；为空时用 DefaultSanitizeReplacement。
+	Replacement string `json:"replacement,omitempty"`
+}
+
+// DefaultSanitizeTerms 是实测过的身份词。
+//
+// 只放真正会被上游当成「第三方 Agent 指纹」的词：
+// 这两个都出现在 DSH 自己的系统提示词里，替换后语义不变。
+var DefaultSanitizeTerms = []string{"DeepSeek Harness"}
+
+// DefaultSanitizeReplacement 是默认替换词。
+//
+// 取下位通称而不是另一个产品名：再写一个品牌名只会成为下一个指纹。
+const DefaultSanitizeReplacement = "the agent runtime"
+
+// IsEnabled 返回开关状态，未配置时默认开启。
+func (sc SanitizeConfig) IsEnabled() bool {
+	return sc.Enabled == nil || *sc.Enabled
+}
+
+// EffectiveTerms 返回实际生效的词表（去掉空白项）。
+func (sc SanitizeConfig) EffectiveTerms() []string {
+	out := make([]string, 0, len(sc.Terms))
+	for _, t := range sc.Terms {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, DefaultSanitizeTerms...)
+	}
+	return out
+}
+
+// EffectiveReplacement 返回实际生效的替换词。
+func (sc SanitizeConfig) EffectiveReplacement() string {
+	if r := strings.TrimSpace(sc.Replacement); r != "" {
+		return r
+	}
+	return DefaultSanitizeReplacement
+}
+
 // ScheduleConfig 是自动任务的开关。
 //
 // 这些开关由模块的 service.sh 定时读取执行，改完即时生效（脚本每 30 秒检查一次）。
@@ -262,6 +318,8 @@ type Config struct {
 	Routing   Routing     `json:"routing"`
 	// Prompt 是网关级系统提示词注入配置（压过客户端自带的 system）
 	Prompt PromptConfig `json:"prompt,omitempty"`
+	// Sanitize 是上下文里的身份词屏蔽（防上游渠道校验 11-128）
+	Sanitize SanitizeConfig `json:"sanitize,omitempty"`
 	// Reasoning 是思考强度默认值
 	Reasoning ReasoningConfig `json:"reasoning,omitempty"`
 	// Schedule 是自动任务开关（由 service.sh 读取执行）

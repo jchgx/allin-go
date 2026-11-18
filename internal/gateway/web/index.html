@@ -619,6 +619,35 @@
   </div>
 
   <div class="card">
+    <h2>身份词屏蔽</h2>
+    <div class="dim" style="font-size:12px;margin-bottom:8px">
+      上游会扫请求里的文本，认出第三方 Agent 的自我描述（例如「You are an AI agent powered by DeepSeek Harness」）后，
+      用 400 / code 11-128 拒掉整条请求。开启后，网关会把下面这些词在上下文里替换成中性说法，降低被认出的概率。
+      <br>注意：上游的判定带自适应成分，同一份内容不同时刻结果可能不同 —— 这项功能是「降低概率」，不是「百分百免疫」；
+      网关同时保留了「改写消息开头后重发」的兜底。改完对下一个请求生效。
+    </div>
+    <div class="field">
+      <label>
+        <input type="checkbox" id="sanitizeEnabled" checked>
+        启用身份词屏蔽
+      </label>
+    </div>
+    <div class="field">
+      <label>要屏蔽的词 <span class="dim">（一行一个，或逗号分隔；大小写不敏感）</span></label>
+      <textarea id="sanitizeTerms" rows="3" placeholder="DeepSeek Harness" style="width:100%;box-sizing:border-box;font-size:12px;line-height:1.5"></textarea>
+    </div>
+    <div class="field">
+      <label>替换成 <span class="dim">（留空用默认 the agent runtime）</span></label>
+      <input type="text" id="sanitizeReplacement" placeholder="the agent runtime" style="width:100%;box-sizing:border-box;font-size:12px">
+    </div>
+    <div class="btnrow">
+      <button class="btn primary" id="btnSaveSanitize">保存</button>
+      <button class="btn" id="btnResetSanitize">恢复默认词表</button>
+    </div>
+    <div id="sanitizeMsg" class="dim" style="font-size:12px;margin-top:6px"></div>
+  </div>
+
+  <div class="card">
     <h2>客户端 API Key</h2>
     <div class="dim" style="font-size:12px;margin-bottom:8px">
       给客户端用的调用凭据，可以给不同设备各发一把、单独吊销。主网关口令本身也能直接当 key 用。
@@ -889,7 +918,7 @@ const LOADERS = {
   accounts: loadAccountsTab,
   usage: loadUsage,
   logs: loadLogs,
-  settings: async () => { await loadSettings(); await loadKeys(); await loadPrompt(); await loadEffort(); await checkUpdate(); },
+  settings: async () => { await loadSettings(); await loadKeys(); await loadPrompt(); await loadSanitize(); await loadEffort(); await checkUpdate(); },
 };
 
 function switchTab(name) {
@@ -2669,6 +2698,57 @@ async function presetM0SS() {
   }
 }
 
+// ---------- 身份词屏蔽 ----------
+async function loadSanitize() {
+  const box = el('sanitizeEnabled'), termsEl = el('sanitizeTerms'), replEl = el('sanitizeReplacement');
+  if (!box || !termsEl || !replEl) return;
+  try {
+    const d = await api('/api/sanitize');
+    box.checked = !!d.enabled;
+    termsEl.value = (d.terms || []).join('\n');
+    replEl.value = d.replacement || '';
+    el('sanitizeMsg').innerHTML = box.checked
+      ? '<span class="dim">当前：已启用，替换为 ' + esc(d.replacement || '') + '</span>'
+      : '<span class="dim">当前：已关闭（身份词原样发给上游）</span>';
+  } catch (e) {
+    el('sanitizeMsg').innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+  }
+}
+
+async function saveSanitize(termsOverride) {
+  const enabled = el('sanitizeEnabled').checked;
+  const terms = termsOverride !== undefined ? termsOverride : el('sanitizeTerms').value.split('\n');
+  const replacement = el('sanitizeReplacement').value.trim();
+  if (enabled && terms.map(s => s.trim()).filter(Boolean).length === 0) {
+    el('sanitizeMsg').innerHTML = '<span class="err">启用时至少要填一个要屏蔽的词</span>';
+    return;
+  }
+  try {
+    const d = await api('/api/sanitize', { method: 'POST', body: { enabled, terms, replacement } });
+    el('sanitizeEnabled').checked = d.enabled;
+    el('sanitizeTerms').value = (d.terms || []).join('\n');
+    el('sanitizeReplacement').value = d.replacement || '';
+    el('sanitizeMsg').innerHTML = '<span class="ok">已保存：' + (d.enabled ? '启用' : '关闭') +
+      '，' + (d.terms || []).length + ' 个词 → ' + esc(d.replacement || '') + '（下一个请求生效）</span>';
+    toast('身份词屏蔽已保存', 'ok');
+  } catch (e) {
+    el('sanitizeMsg').innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    toast(e.message, 'err');
+  }
+}
+
+async function resetSanitize() {
+  try {
+    const d = await api('/api/sanitize');
+    const def = d.defaults || {};
+    el('sanitizeTerms').value = (def.terms || []).join('\n');
+    el('sanitizeReplacement').value = def.replacement || '';
+    await saveSanitize(def.terms || []);
+  } catch (e) {
+    el('sanitizeMsg').innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+  }
+}
+
 // ---------- 客户端 API Key ----------
 async function loadKeys() {
   const box = el('keyList');
@@ -3074,6 +3154,8 @@ on('btnApplyUpdate', 'click', applyUpdate);
 on('btnSaveEffort', 'click', saveEffort);
 on('btnReloadEffort', 'click', loadEffort);
 on('btnSavePrompt', 'click', savePrompt);
+on('btnSaveSanitize', 'click', () => saveSanitize());
+on('btnResetSanitize', 'click', resetSanitize);
 on('btnPresetM0SS', 'click', presetM0SS);
 on('btnReloadPrompt', 'click', loadPrompt);
 on('promptText', 'input', () => { el('promptLen').textContent = '（' + el('promptText').value.length + ' 字符）'; });

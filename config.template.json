@@ -263,5 +263,13 @@
   "routing": {
     "groupsEnabled": true,
     "bareModelFallback": false
+  },
+  "sanitize": {
+    "enabled": true,
+    "terms": [
+      "DeepSeek Harness"
+    ],
+    "replacement": "the agent runtime",
+    "_说明": "上下文身份词屏蔽：上游按「像不像官方客户端」判定，认出第三方 Agent 的自我描述会用 400/11-128 拒掉整条请求。开启后把这些词替换成中性说法（大小写不敏感），降低被认出的概率。"
   }
 }

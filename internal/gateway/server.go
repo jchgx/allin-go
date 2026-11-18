@@ -89,6 +89,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/effort", s.withAuth(s.handleEffort))
 	s.mux.HandleFunc("/api/prompt", s.withAuth(s.handlePrompt))
 	s.mux.HandleFunc("/api/prompt/preset", s.withAuth(s.handlePromptPreset))
+	s.mux.HandleFunc("/api/sanitize", s.withAuth(s.handleSanitize))
 	s.mux.HandleFunc("/api/keys", s.withAuth(s.handleKeys))
 	s.mux.HandleFunc("/api/keys/toggle", s.withAuth(s.handleKeyToggle))
 	s.mux.HandleFunc("/api/usage", s.withAuth(s.handleUsage))
@@ -359,6 +360,17 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 			upstreamBody = prepared
 		} else {
 			log.Printf("WorkBuddy 请求预处理失败（按原样发送）: %v", perr)
+		}
+		// 身份词屏蔽：把上下文里会被上游认成「第三方 Agent」的词换成中性说法，
+		// 降低被渠道校验（11-128）盯上的概率。放在裁剪之前，后面的快照与重裁
+		// 都基于已经屏蔽过的内容，避免重裁时把原文又捡回来。
+		if sc := cfg.Sanitize; sc.IsEnabled() {
+			terms := sc.EffectiveTerms()
+			repl := sc.EffectiveReplacement()
+			if masked, n, merr := workbuddy.MaskTerms(upstreamBody, terms, repl); merr == nil && n > 0 {
+				upstreamBody = masked
+				log.Printf("身份词屏蔽：替换 %d 处（%s → %s）", n, strings.Join(terms, " / "), repl)
+			}
 		}
 		// 上下文裁剪：先按默认阈值裁一次。
 		// 若上游仍嫌大（见下面的续写逻辑），会用更小预算重裁。
