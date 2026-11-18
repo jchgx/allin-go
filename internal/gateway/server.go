@@ -349,6 +349,8 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 	// channelRepairs 是「渠道校验失败后改写消息开头」的重发次数。
 	// 每次都会把更多开头挪出匹配区，正常情况下一次就够。
 	channelRepairs := 0
+	// channelBase 是被渠道校验拒绝时那份请求体的快照，救援改写永远从它出发。
+	var channelBase []byte
 
 	// WorkBuddy 需要请求体适配：工具名规范化、tool_choice 归一化、补 reasoning_effort
 	if kind == provider.KindWorkBuddy {
@@ -360,6 +362,12 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 			upstreamBody = prepared
 		} else {
 			log.Printf("WorkBuddy 请求预处理失败（按原样发送）: %v", perr)
+		}
+		// 官方客户端兼容规则（移植自 dsh-connect-workbuddy 的实测规则集）：
+		// developer→system、补首条 system、句子级指纹改词、身份子句断词、
+		// 命中前缀指纹的消息补中性开头。都是便宜且幂等的改写。
+		if ident, changed := workbuddy.ApplyIdentityRules(upstreamBody); changed {
+			upstreamBody = ident
 		}
 		// 身份词屏蔽：把上下文里会被上游认成「第三方 Agent」的词换成中性说法，
 		// 降低被渠道校验（11-128）盯上的概率。放在裁剪之前，后面的快照与重裁
@@ -571,7 +579,13 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 					// 之后再退避重发：上游自己回的 displayMsg 就写着「请求被拦截，
 					// 请重新发送」，同一份内容重发本来就常常能过。
 					if kind == provider.KindWorkBuddy && channelRepairs < maxChannelRepairs {
-						if nb, changed := s.repairChannelBlock(cfg, stepBody); changed {
+						// 始终从「被拒那一版的原始请求体」出发改写：
+						// 在已经改过的产物上再改会让断词层层叠加（实测每轮多加
+						// 一批 U+200B），既浪费也不可预测。
+						if channelBase == nil {
+							channelBase = stepBody
+						}
+						if nb, changed := s.repairChannelBlock(cfg, channelBase, channelRepairs+1); changed {
 							channelRepairs++
 							stepBody = nb
 							if forced, ferr := workbuddy.ForceStream(stepBody); ferr == nil {
@@ -1133,7 +1147,7 @@ func (s *Server) failModel(w http.ResponseWriter, msg string, cfg *config.Config
 //   - 改写开头：对付只看消息开头的那类规则。
 //
 // 两步都只动文本，不碰 tools / tool_choice / tool 配对，避免换来 11148。
-func (s *Server) repairChannelBlock(cfg *config.Config, body []byte) ([]byte, bool) {
+func (s *Server) repairChannelBlock(cfg *config.Config, body []byte, round int) ([]byte, bool) {
 	out := body
 	changed := false
 
@@ -1143,12 +1157,21 @@ func (s *Server) repairChannelBlock(cfg *config.Config, body []byte) ([]byte, bo
 		terms = cfg.Sanitize.EffectiveTerms()
 		repl = cfg.Sanitize.EffectiveReplacement()
 	}
+	// 第一步：屏蔽身份词（全量、任意位置）
 	if masked, n, err := workbuddy.MaskTerms(out, terms, repl); err == nil && n > 0 {
 		out = masked
 		changed = true
 	}
-	if neutral, ok, err := workbuddy.NeutralizeChannelBlock(out); err == nil && ok {
+	// 第二步：强制给每条被扫描消息补中性开头（未知指纹一样被挪走）
+	if neutral, ok := workbuddy.ForceNeutralHead(out); ok {
 		out = neutral
+		changed = true
+	}
+	// 第三步：插不可见断词，破精确子串匹配。第 1 轮用稀疏档（实测够用、改动最小），
+	// 第 2 轮用密集档（每个词内部都断），用来对付前两档都没清掉的子串指纹。
+	dense := round >= 2
+	if perturbed, ok := workbuddy.PerturbFingerprints(out, dense); ok {
+		out = perturbed
 		changed = true
 	}
 	return out, changed

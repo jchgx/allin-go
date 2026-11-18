@@ -16,7 +16,7 @@ func TestRepairChannelBlockMasksAndNeutralizes(t *testing.T) {
 	cfg := &config.Config{} // 未配置 → 用默认词表
 	in := []byte(`{"model":"m","messages":[{"role":"system","content":"You are an AI agent powered by DeepSeek Harness."}]}`)
 
-	out, changed := s.repairChannelBlock(cfg, in)
+	out, changed := s.repairChannelBlock(cfg, in, 1)
 	if !changed {
 		t.Fatal("应当判为已改写")
 	}
@@ -45,7 +45,7 @@ func TestRepairChannelBlockIgnoresDisabledConfig(t *testing.T) {
 	cfg := &config.Config{Sanitize: config.SanitizeConfig{Enabled: &off}}
 	in := []byte(`{"messages":[{"role":"system","content":"powered by DeepSeek Harness"}]}`)
 
-	out, changed := s.repairChannelBlock(cfg, in)
+	out, changed := s.repairChannelBlock(cfg, in, 1)
 	if !changed {
 		t.Fatal("关掉屏蔽时救援仍应生效")
 	}
@@ -62,23 +62,45 @@ func TestRepairChannelBlockUsesCustomTerms(t *testing.T) {
 		Enabled: &on, Terms: []string{"MyAgent"}, Replacement: "the agent",
 	}}
 	in := []byte(`{"messages":[{"role":"system","content":"I am MyAgent, hello."}]}`)
-	out, changed := s.repairChannelBlock(cfg, in)
+	out, changed := s.repairChannelBlock(cfg, in, 1)
 	if !changed || strings.Contains(string(out), "MyAgent") {
 		t.Fatalf("自定义词表没生效: changed=%v %s", changed, out)
 	}
 }
 
-// 没有任何可改的地方时，必须报「改不动」——否则调用方会拿同样的字节再发一次，
-// 白白再付一个 400。
+// 没有可改的地方时要报「改不动」，否则调用方会拿同样的字节再发一次、
+// 白白再付一个 400。能被扫描的角色只有 system/developer/assistant，
+// 纯 user 请求不属于要救的范围。
 func TestRepairChannelBlockReportsNothingToChange(t *testing.T) {
 	s := &Server{}
 	cfg := &config.Config{}
-	head := workbuddy.NeutralHead + "\n\n没有指纹的一句话，并且已经带中性头。"
-	in, _ := json.Marshal(map[string]any{
-		"messages": []map[string]string{{"role": "system", "content": head}},
-	})
-	out, changed := s.repairChannelBlock(cfg, in)
+	in := []byte(`{"messages":[{"role":"user","content":"用户的话，不该被动"}]}`)
+	out, changed := s.repairChannelBlock(cfg, in, 1)
 	if changed {
 		t.Errorf("本来无可改，却报已改写: %s", out)
+	}
+}
+
+// 第 2 轮要能叠加密集档：稀疏档没清掉的子串，靠逐字断词再试一次。
+func TestRepairChannelBlockEscalatesToDense(t *testing.T) {
+	s := &Server{}
+	cfg := &config.Config{}
+	in := []byte(`{"messages":[{"role":"system","content":"DeepSeek Harness 是这样一段没有任何标点的文本"}]}`)
+
+	first, ok := s.repairChannelBlock(cfg, in, 1)
+	if !ok {
+		t.Fatal("第 1 轮应当改动")
+	}
+	second, ok := s.repairChannelBlock(cfg, first, 2)
+	if !ok {
+		t.Fatal("第 2 轮应当升级到密集档")
+	}
+	if strings.Count(string(second), workbuddy.ZeroWidthSpace) <= strings.Count(string(first), workbuddy.ZeroWidthSpace) {
+		t.Error("密集档没有增加断词")
+	}
+	// 两轮都从同一份原始请求体出发改写，不在已改产物上叠加
+	base, _ := s.repairChannelBlock(cfg, in, 2)
+	if strings.Count(string(base), workbuddy.ZeroWidthSpace) != strings.Count(string(second), workbuddy.ZeroWidthSpace) {
+		t.Error("密集档的起点应当始终是原始请求体，结果必须一致")
 	}
 }
