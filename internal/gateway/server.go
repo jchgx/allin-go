@@ -345,6 +345,9 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 	trimRounds := 0
 	trimBudget := 0
 	softRetries := 0
+	// channelRepairs 是「渠道校验失败后改写消息开头」的重发次数。
+	// 每次都会把更多开头挪出匹配区，正常情况下一次就够。
+	channelRepairs := 0
 
 	// WorkBuddy 需要请求体适配：工具名规范化、tool_choice 归一化、补 reasoning_effort
 	if kind == provider.KindWorkBuddy {
@@ -546,7 +549,34 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 				}
 				if fallback.IsChannelBlocked(string(sniff)) {
 					resp.Body.Close()
-					log.Printf("渠道校验失败（code 11128），不做换号重试: %s/%s", sp.ID, acct.ID)
+					// 渠道校验是「消息开头像非官方客户端」的前缀匹配，换号、换模型
+					// 发出去的都是同一份内容，重试只会一次次被拒。
+					//
+					// 真正有效的是改消息开头：给每个被扫描的开头补一行中性开头。
+					// 实测这样能救回来（见 internal/provider/workbuddy/channel.go），
+					// 且不依赖认识是哪一条指纹，所以放在别的重试分支之前。
+					if kind == provider.KindWorkBuddy &&
+						channelRepairs < maxChannelRepairs {
+						if nb, repaired, nerr := workbuddy.NeutralizeChannelBlock(stepBody); nerr == nil && repaired {
+							channelRepairs++
+							stepBody = nb
+							if forced, ferr := workbuddy.ForceStream(stepBody); ferr == nil {
+								stepBody = forced
+							}
+							log.Printf("渠道校验失败（code 11128），改写消息开头后重发第 %d 次: %s/%s",
+								channelRepairs, sp.ID, acct.ID)
+							// 内容已变，同一个号值得再试一次：把这次尝试退回，
+							// 既不消耗换号次数，也不能把账号留在「已试过」里 ——
+							// 否则下一轮 PickForSession 无人可选，会误判成「额度耗尽」
+							// 直接进模型降级链。
+							delete(tried, acct.ID)
+							s.pool.Reset(sp.ID, acct.ID)
+							s.pool.UnbindSession(sessKey)
+							attempt--
+							continue
+						}
+					}
+					log.Printf("渠道校验失败（code 11128），改写后仍被拒: %s/%s", sp.ID, acct.ID)
 					s.fail(w, http.StatusBadRequest, fallback.ChannelBlockedHint())
 					return
 				}
@@ -1124,3 +1154,8 @@ const (
 // maxSoftRetries 是「上游瞬态拒绝」的原地重发次数。
 // 11148 属瞬时状态，重发通常就过；给 2 次足够，避免掩盖真问题。
 const maxSoftRetries = 2
+
+// maxChannelRepairs 是「渠道校验失败 → 改写消息开头 → 重发」的次数。
+// 改写对所有被扫描的开头生效，一轮即可把整份请求挪出匹配区；
+// 给 2 次是为了兜住首轮只改到部分开头的情况。
+const maxChannelRepairs = 2
