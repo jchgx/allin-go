@@ -78,9 +78,13 @@ func detectServers() []string {
 		}
 	}
 	// 3) 公共 DNS 兜底（国内可达优先）
+	//
+	// 不再放 8.8.8.8：国内多数网络到它没有路由，加了它只会让最后的
+	// 报错变成「dial udp 8.8.8.8:53: connect: network is unreachable」，
+	// 把「DNS 服务器不可达」写成一句看起来像本机网卡坏了的话
+	// （线上日志里就是这么误导排查的）。真要海外 DNS，用 ALLIN_DNS 指定。
 	add("223.5.5.5")
 	add("119.29.29.29")
-	add("8.8.8.8")
 
 	return out
 }

@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,38 @@ const creditsRefreshInterval = 10 * time.Minute
 
 // creditsRefreshTimeout 是一次全量刷新的总超时。
 const creditsRefreshTimeout = 60 * time.Second
+
+// creditsNetRetries 是「网络没就绪」类错误的额外重试次数。
+//
+// 只用于 DNS 解析失败 / 连接被拒这类临时状态；凭据失效（401/403）
+// 重试毫无意义，那些会走 isAuthError 分支把账号标死。
+const creditsNetRetries = 2
+
+// isNetReadyError 判断这次失败是不是「网络还没就绪」造成的。
+//
+// 依据 Go 的错误文本比依据类型稳：DNS 失败是 *net.DNSError，
+// 而「connect: network is unreachable」藏在 *net.OpError 的链里，
+// 两者都只在这类临时状态下出现。
+func isNetReadyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	low := strings.ToLower(err.Error())
+	for _, kw := range []string{
+		"no such host", "network is unreachable", "connection refused",
+		"i/o timeout", "temporary failure in name resolution",
+		"server misbehaving", "connection reset",
+	} {
+		if strings.Contains(low, kw) {
+			return true
+		}
+	}
+	return false
+}
 
 // startCreditsRefresher 定期拉取 WorkBuddy 账号积分并写入账号池。
 //
@@ -80,6 +114,17 @@ func (s *Server) refreshCredits(parent context.Context) {
 		go func(j job) {
 			defer wg.Done()
 			sum, err := workbuddy.GetCredits(ctx, j.customer)
+			// 启动瞬间常常还没连上网（尤其刚开机/刚切网），一次失败就放弃会让
+			// 面板上的余额一直停在空档，日志里只剩一句看不懂的 DNS 错误。
+			// 只对「明显是网络没就绪」的错误重试：凭据/接口类错误重试没有意义。
+			for attempt := 1; err != nil && attempt <= creditsNetRetries && isNetReadyError(err); attempt++ {
+				log.Printf("积分刷新重试 %d/%d: %s/%s: %v", attempt, creditsNetRetries, j.providerID, j.accountID, err)
+				select {
+				case <-time.After(time.Duration(1500*attempt) * time.Millisecond):
+				case <-ctx.Done():
+				}
+				sum, err = workbuddy.GetCredits(ctx, j.customer)
+			}
 			if err != nil {
 				// 查不到就保留旧快照，让它自然过期失效，不要清零余额
 				log.Printf("积分刷新失败: %s/%s: %v", j.providerID, j.accountID, err)

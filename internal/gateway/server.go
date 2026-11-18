@@ -561,30 +561,37 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, apiPath string,
 				}
 				if fallback.IsChannelBlocked(string(sniff)) {
 					resp.Body.Close()
-					// 渠道校验是「消息开头像非官方客户端」的前缀匹配，换号、换模型
-					// 发出去的都是同一份内容，重试只会一次次被拒。
+					// 渠道校验是上游按「请求像不像官方客户端」做的判定。
+					// 换号、换模型发出去的都是同一份内容，所以换号无效。
 					//
-					// 真正有效的是改消息开头：给每个被扫描的开头补一行中性开头。
-					// 实测这样能救回来（见 internal/provider/workbuddy/channel.go），
-					// 且不依赖认识是哪一条指纹，所以放在别的重试分支之前。
-					if kind == provider.KindWorkBuddy &&
-						channelRepairs < maxChannelRepairs {
-						if nb, repaired, nerr := workbuddy.NeutralizeChannelBlock(stepBody); nerr == nil && repaired {
+					// 兜底分两步，两步都要做：
+					//   1) 屏蔽身份词（全量、任意位置）—— 上游若在全文中找指纹，
+					//      只挪开头没有用（线上日志证实：改写开头后仍被拒）。
+					//   2) 改写被扫描消息的开头 —— 对付只看开头的那类规则。
+					// 之后再退避重发：上游自己回的 displayMsg 就写着「请求被拦截，
+					// 请重新发送」，同一份内容重发本来就常常能过。
+					if kind == provider.KindWorkBuddy && channelRepairs < maxChannelRepairs {
+						if nb, changed := s.repairChannelBlock(cfg, stepBody); changed {
 							channelRepairs++
 							stepBody = nb
 							if forced, ferr := workbuddy.ForceStream(stepBody); ferr == nil {
 								stepBody = forced
 							}
-							log.Printf("渠道校验失败（code 11128），改写消息开头后重发第 %d 次: %s/%s",
+							log.Printf("渠道校验失败（code 11-128），屏蔽身份词+改写开头后重发第 %d 次: %s/%s",
 								channelRepairs, sp.ID, acct.ID)
-							// 内容已变，同一个号值得再试一次：把这次尝试退回，
-							// 既不消耗换号次数，也不能把账号留在「已试过」里 ——
-							// 否则下一轮 PickForSession 无人可选，会误判成「额度耗尽」
-							// 直接进模型降级链。
+							// 内容已变，同一个号值得再试一次：把这次尝试退回，既不消耗
+							// 换号次数，也不能把账号留在「已试过」里 —— 否则下一轮
+							// PickForSession 无人可选，会误判成「额度耗尽」进降级链。
 							delete(tried, acct.ID)
 							s.pool.Reset(sp.ID, acct.ID)
 							s.pool.UnbindSession(sessKey)
 							attempt--
+							// 退避：连发同一份内容更容易再次撞上同一个判定。
+							select {
+							case <-time.After(time.Duration(400*channelRepairs) * time.Millisecond):
+							case <-r.Context().Done():
+								return
+							}
 							continue
 						}
 					}
@@ -1111,6 +1118,40 @@ func (s *Server) failModel(w http.ResponseWriter, msg string, cfg *config.Config
 			"hint":             "模型名要写成 provider/model，可在面板「供应商」页的模型筛选里查看已暴露的模型",
 		},
 	})
+}
+
+// repairChannelBlock 构造「渠道校验被拒之后」的重发请求体。
+//
+// 返回 changed=false 表示这份请求已经没有可改的地方了 —— 再发一次就是
+// 同样的字节，只会再付一次同样的 400，所以调用方应当直接报错。
+//
+// 两步一起做，因为线上日志证实单靠一步救不回来：
+//
+//   - 屏蔽身份词：上游若在全文里找第三方 Agent 的自我描述，只挪开头没有用。
+//     这里用配置的词表；配置里关掉了屏蔽也仍然用默认词表兜这次重发 ——
+//     请求已经被拒了，此时再用默认词表只会提高通过率，不会更糟。
+//   - 改写开头：对付只看消息开头的那类规则。
+//
+// 两步都只动文本，不碰 tools / tool_choice / tool 配对，避免换来 11148。
+func (s *Server) repairChannelBlock(cfg *config.Config, body []byte) ([]byte, bool) {
+	out := body
+	changed := false
+
+	terms := config.DefaultSanitizeTerms
+	repl := config.DefaultSanitizeReplacement
+	if cfg != nil && cfg.Sanitize.IsEnabled() {
+		terms = cfg.Sanitize.EffectiveTerms()
+		repl = cfg.Sanitize.EffectiveReplacement()
+	}
+	if masked, n, err := workbuddy.MaskTerms(out, terms, repl); err == nil && n > 0 {
+		out = masked
+		changed = true
+	}
+	if neutral, ok, err := workbuddy.NeutralizeChannelBlock(out); err == nil && ok {
+		out = neutral
+		changed = true
+	}
+	return out, changed
 }
 
 func (s *Server) fail(w http.ResponseWriter, code int, msg string) {
